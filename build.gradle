@@ -1,0 +1,36 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath("org.springframework.boot:spring-boot-gradle-plugin:1.5.2.RELEASE")
+    }
+}
+
+apply plugin: 'java'
+apply plugin: 'org.springframework.boot'
+
+sourceCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+}
+
+jar {
+    baseName = 'redditbooks'
+    version =  '1.0.0'
+}
+
+dependencies {
+    compile("org.springframework.boot:spring-boot-starter-web")
+    compile("org.springframework.boot:spring-boot-starter-data-mongodb")
+
+    compile group: 'org.apache.commons', name: 'commons-lang3', version: '3.5'
+    compile group: 'org.apache.commons', name: 'commons-io', version: '1.3.2'
+    compile group: 'commons-codec', name: 'commons-codec', version: '1.10'
+
+    compile group: 'com.linkedin.urls', name: 'url-detector', version: '0.1.17'
+    compile group: 'de.malkusch.amazon.product-advertising-api', name: 'amazon-ecs-api', 'version': '1.1.2'
+
+    testCompile group: 'junit', name: 'junit', version: '4.11'
+}
