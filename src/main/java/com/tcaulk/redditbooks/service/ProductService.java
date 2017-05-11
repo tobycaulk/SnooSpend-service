@@ -2,9 +2,11 @@ package com.tcaulk.redditbooks.service;
 
 import com.ECS.client.jax.ItemLookupRequest;
 import com.ECS.client.jax.Items;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linkedin.urls.Url;
 import com.linkedin.urls.detection.UrlDetector;
 import com.linkedin.urls.detection.UrlDetectorOptions;
+import com.tcaulk.redditbooks.model.BigQueryComment;
 import com.tcaulk.redditbooks.model.Product;
 import com.tcaulk.redditbooks.service.mongo.ProductRepository;
 import de.malkusch.amazon.ecs.ProductAdvertisingAPI;
@@ -12,11 +14,13 @@ import de.malkusch.amazon.ecs.configuration.PropertiesConfiguration;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.LineIterator;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.log4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.io.*;
+import java.io.File;
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -27,26 +31,34 @@ import java.util.regex.Pattern;
 
 @Service
 public class ProductService {
+    private static final Logger log = Logger.getLogger(ProductService.class);
 
-    private static final String AWS_ACCESS_KEY_ID = "AKIAIMJDHDNJ3RYVDGHQ";
-    private static final String AWS_SECRET_KEY = "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";
-    private static final String ENDPOINT = "webservices.amazon.com";
+    private static final int DP_START_INDEX = 4;
+    private static final int DP_LENGTH = 10;
+    private static final int API_RATE_DELAY = 1250;
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Pattern ASIN_PATTERN = Pattern.compile("\\/dp\\/\\w+");
+    private static final ScheduledExecutorService EXECUTOR_SERVICE = Executors.newScheduledThreadPool(20);
+    private static final List<String> PRODUCT_ITEM_RESPONSE_GROUPS = Arrays.asList("Images", "ItemAttributes", "EditorialReview", "Offers");
 
     private ProductRepository productRepository;
-    private ScheduledExecutorService executorService = Executors.newScheduledThreadPool(20);
     private ProductAdvertisingAPI productAdvertisingAPI;
-    private String month;
+    private Map<String, Product> discoveredProducts = new HashMap<>();
 
     @Autowired
-    public ProductService(ProductRepository productRepository,
-                          @Value("${accessKey}") String accessKey,
-                          @Value("${secretKey}") String secretKey,
-                          @Value("${associateTag}") String associateTag,
-                          @Value("${month}") String month) {
+    public ProductService(
+            ProductRepository productRepository,
+            @Value("${accessKey}") String accessKey,
+            @Value("${secretKey}") String secretKey,
+            @Value("${associateTag}") String associateTag) {
 
-        this.month = month;
         this.productRepository = productRepository;
+        this.productAdvertisingAPI = productAdvertisingAPI;
 
+        setupProductAdvertisingAPI(associateTag, accessKey, secretKey);
+    }
+
+    private void setupProductAdvertisingAPI(String associateTag, String accessKey, String secretKey) {
         Properties properties = new Properties();
         try {
             properties.setProperty("amazon.accessKey", accessKey);
@@ -59,165 +71,96 @@ public class ProductService {
         }
     }
 
-    public void retrieveProducts(String fileUrl) {
+    public void processFile(String fileUrl) {
         File file = new File(fileUrl);
 
         long startTime = System.currentTimeMillis();
+
         try {
             LineIterator it = FileUtils.lineIterator(file);
             while(it.hasNext()) {
-                String line = it.nextLine();
-                line = line.replaceAll("\\)", " ");
-                line = line.replaceAll("\"", " ");
-                line = line.replaceAll("\\\\n", "");
-                line = line.replaceAll("\\\\r", "");
-                line = line.replaceAll("\'", " ");
-                line = line.replaceAll("\\(", " ");
-                line = line.replaceAll("\\[", " ");
-                line = line.replaceAll("]", " ");
-                line = line.replaceAll("\\?", "");
-                line = line.replaceAll("\\*", "");
-
-                try {
-                    List<Url> urls = new UrlDetector(line, UrlDetectorOptions.Default).detect();
-                    Map<String, Integer> products = new HashMap<>();
-                    urls.stream().filter(url -> url.getFullUrl().contains("amazon") && (StringUtils.countMatches(url.getFullUrl(), "http") <= 1 || StringUtils.countMatches(url.getFullUrl(), "http") <= 1)).forEach(url -> {
-                        String asin = getASINFromURL(url.getFullUrl());
-                        if(!StringUtils.isEmpty(asin)) {
-                            if (!products.containsKey(asin)) {
-                                products.put(asin, 0);
-                            }
-                            products.put(asin, products.get(asin) + 1);
-                            System.out.println(url.getFullUrl() + " [" + asin + "] [" + products.get(asin) + "]");
-                        }
-                    });
-
-                    if(!products.isEmpty()) {
-                        processProducts(new HashMap<String, Integer>(products));
-                    }
-
-                    products.clear();
-                } catch(Exception e) {
-                    //e.printStackTrace();
+                BigQueryComment comment = MAPPER.readValue(it.nextLine(), BigQueryComment.class);
+                if(comment != null) {
+                    processComment(comment);
                 }
             }
-        } catch (IOException e) {
-            e.printStackTrace();
+        } catch(Exception e) {
+            log.error("Error while processing file [" + fileUrl + "]", e);
         }
 
         long endTime = System.currentTimeMillis();
-        long delta = endTime - startTime;
-        System.out.println("Processing took [" + delta + "] milliseconds");
+        log.info("Processing took [" + (endTime - startTime) + "] milliseconds");
     }
 
-    private String getASINFromURL(String url) {
-        String asin = "";
-
-        Pattern asinPattern = Pattern.compile("\\/dp\\/\\w+");
-        Matcher asinMatcher = asinPattern.matcher(url);
-        while(asinMatcher.find()) {
-            String asinWithDP = asinMatcher.group();
-            asin = asinWithDP.substring(4, 14);
-        }
-
-        return asin;
-    }
-
-    public void postProcessProducts() {
-        List<Product> stagedProducts = productRepository.findByProcessed(false);
-        Collections.sort(stagedProducts);
+    public void processAmazonProducts() {
+        List<Product> products = new ArrayList<>();
+        discoveredProducts.forEach((key, value) -> {
+            products.add(value);
+        });
+        Collections.sort(products);
 
         AtomicInteger currentIndex = new AtomicInteger(-1);
-        executorService.scheduleAtFixedRate(() -> {
-            executorService.execute(() -> {
-                getAmazonProductDetails(stagedProducts.get(currentIndex.incrementAndGet()));
-            });
-        },0,1250, TimeUnit.MILLISECONDS);
-    }
+        EXECUTOR_SERVICE.scheduleAtFixedRate(() -> {
+            Product product = products.get(currentIndex.incrementAndGet());
 
-    private Product getAmazonProductDetails(Product product) {
-        if(product.getASIN() != null) {
             ItemLookupRequest request = new ItemLookupRequest();
             request.getItemId().add(product.getASIN());
-            request.getResponseGroup().add("Images");
-            request.getResponseGroup().add("ItemAttributes");
-            request.getResponseGroup().add("EditorialReview");
-            request.getResponseGroup().add("Offers");
+            PRODUCT_ITEM_RESPONSE_GROUPS.forEach(responseGroup -> {
+                request.getResponseGroup().add(responseGroup);
+            });
 
             try {
                 Items items = productAdvertisingAPI.getItemLookup().call(request);
-                product.setProcessed(true);
+                product.setCreateDate(new Date());
                 product.setItem(items.getItem().get(0));
 
-                productRepository.save(product);
-                System.out.println("Saved item[" + product.getASIN() + "]");
-            } catch (Exception e) {
-                e.printStackTrace();
-                productRepository.delete(product);
+                productRepository.insert(product);
+                log.info("Inserted product with ASIN[" + product.getASIN() + "]");
+            } catch(Exception e) {
+                log.error("Error while retrieving item from Amazon with ASIN[" + product.getASIN() + "]", e);
             }
-        }
-
-        return product;
+        }, 0, API_RATE_DELAY, TimeUnit.MILLISECONDS);
     }
 
-    private Product getProduct(String asin, int popularity) {
-        Product product = new Product();
+    private void processComment(BigQueryComment comment) {
+        List<Url> urls = detectUrlsInComment(comment);
+        urls.stream()
+            .filter(url ->
+                url.getFullUrl().contains("amazon")
+                && (StringUtils.countMatches(url.getFullUrl(), "http") <= 1
+                || StringUtils.countMatches(url.getFullUrl(), "https") <= 1))
+            .forEach(url -> {
+                String asin = getAsinFromUrl(url);
+                if(!StringUtils.isEmpty(asin)) {
+                    if(!discoveredProducts.containsKey(asin)) {
+                        Product product = new Product();
+                        product.setASIN(asin);
+                        product.addSubreddit(comment.getSubreddit());
+                        product.setPopularity(0);
 
-        product.setCreateDate(new Date());
-        product.setPopularity(popularity);
-        product.setMonth(month);
+                        discoveredProducts.put(asin, product);
+                    }
 
-        product.setASIN(asin);
-
-        return product;
-    }
-
-    private void processProducts(Map<String, Integer> products) {
-        System.out.println("Process products");
-        products.keySet().stream().forEach(key -> {
-            System.out.println("Processing key[" + key + "]");
-            Product product = getProduct(key, products.get(key));
-            if(product.getASIN() != null) {
-                System.out.println("asin isnt null");
-                Product repositoryProduct = null;
-                try {
-                    repositoryProduct = productRepository.findByAsin(product.getASIN());
-                } catch(Exception e) {
-                    e.printStackTrace();
+                    Product product = discoveredProducts.get(asin);
+                    product.setPopularity(product.getPopularity() + 1);
+                    product.addSubreddit(comment.getSubreddit());
+                    discoveredProducts.put(asin, product);
                 }
-                if(repositoryProduct != null) {
-                    System.out.println(repositoryProduct.getASIN());
-                    System.out.println("Saved");
-                    repositoryProduct.setPopularity(repositoryProduct.getPopularity() + products.get(key));
-                    productRepository.save(repositoryProduct);
-                } else {
-                    System.out.print("Inserted");
-                    productRepository.insert(product);
-                }
-            }
-        });
+            });
     }
 
-    public void consolidate() {
-        List<Product> products = productRepository.findAll();
-        HashMap<String, Product> map = new HashMap<>();
+    private List<Url> detectUrlsInComment(BigQueryComment comment) {
+        return new UrlDetector(comment.getBody(), UrlDetectorOptions.Default).detect();
+    }
 
-        for(Product product : products) {
-            if(!map.containsKey(product.getASIN())) {
-                map.put(product.getASIN(), product);
-            } else {
-                Product mapProduct = map.get(product.getASIN());
-                mapProduct.setPopularity(mapProduct.getPopularity() + 1);
+    private String getAsinFromUrl(Url url) {
+        String asin = "";
 
-                map.put(product.getASIN(), mapProduct);
-                productRepository.delete(product);
-            }
+        Matcher asinMatcher = ASIN_PATTERN.matcher(url.getFullUrl());
+        while(asinMatcher.find()) {
+           asin = asinMatcher.group().substring(DP_START_INDEX, DP_START_INDEX + DP_LENGTH);
         }
 
-        for(String asin : map.keySet()) {
-            productRepository.save(map.get(asin));
-        }
-
-        System.out.println("Done");
+        return asin;
     }
 }

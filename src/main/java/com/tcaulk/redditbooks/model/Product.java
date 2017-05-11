@@ -4,7 +4,9 @@ import com.ECS.client.jax.Item;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.data.annotation.Id;
 
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 public class Product implements Comparable<Product> {
 
@@ -12,9 +14,8 @@ public class Product implements Comparable<Product> {
     private String asin;
     private Date createDate;
     private int popularity;
-    private boolean processed;
-    private String month;
     private Item item;
+    private List<String> subreddits = new ArrayList<>();
 
     @Id
     public String getId() {
@@ -52,24 +53,6 @@ public class Product implements Comparable<Product> {
         this.popularity = popularity;
     }
 
-    @JsonProperty("Processed")
-    public boolean isProcessed() {
-        return processed;
-    }
-
-    public void setProcessed(boolean processed) {
-        this.processed = processed;
-    }
-
-    @JsonProperty("Month")
-    public String getMonth() {
-        return month;
-    }
-
-    public void setMonth(String month) {
-        this.month = month;
-    }
-
     @JsonProperty("Item")
     public Item getItem() {
         return item;
@@ -79,8 +62,21 @@ public class Product implements Comparable<Product> {
         this.item = item;
     }
 
+    @JsonProperty("Subreddits")
+    public List<String> getSubreddits() {
+        return subreddits;
+    }
+
+    public void setSubreddits(List<String> subreddits) {
+        this.subreddits = subreddits;
+    }
+
+    public void addSubreddit(String subreddit) {
+        subreddits.add(subreddit);
+    }
+
     @Override
     public int compareTo(Product product) {
-        return popularity == product.popularity ? 0 : popularity > product.popularity ? 1 : -1;
+        return popularity == product.popularity ? 0 : popularity > product.popularity ? -1 : 1;
     }
 }
